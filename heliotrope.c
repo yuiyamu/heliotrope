@@ -235,10 +235,6 @@ enum HelioReturnCode helio_compress(char *folder_path, char *filename, char *ext
     char **dir_list = helio_list_dir(folder_path, true);
     if (!dir_list) return FILE_NOT_EXIST;
 
-    for (int i = 0; dir_list[i] != NULL; i++) {
-        printf("%s\n", dir_list[i]);
-    }
-
     struct HelioFile **files = NULL;
     int num_files = 0;
     size_t next_file_offset = 0;
@@ -381,7 +377,6 @@ enum HelioReturnCode helio_compress(char *folder_path, char *filename, char *ext
     }
 
     //eosd!!
-    printf("writing eosd to file...\n");
     unsigned char embodiment_of_scarlet_devil[22] = {0};
     memcpy(embodiment_of_scarlet_devil, eocd_header, 4);
     int_to_two_bytes(num_files - skipped_num, embodiment_of_scarlet_devil + 8);
