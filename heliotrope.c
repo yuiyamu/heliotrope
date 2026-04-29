@@ -3,10 +3,13 @@
 #include <errno.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include <dirent.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <zlib.h>
+
+//TODO: crc32, file modification time, fix crash extracting some (osugds)
 
 static uint16_t two_byte_to_int(const unsigned char byte_1, const unsigned char byte_2) {
     return byte_1 | (byte_2 << 8);
@@ -14,6 +17,18 @@ static uint16_t two_byte_to_int(const unsigned char byte_1, const unsigned char 
 
 static uint32_t four_byte_to_int(const unsigned char byte_1, const unsigned char byte_2, const unsigned char byte_3, const unsigned char byte_4) {
     return byte_1 | (byte_2 << 8) | (byte_3 << 16) | (byte_4 << 24);
+}
+
+static void int_to_two_bytes(const uint16_t value, unsigned char *buf) {
+    buf[0] = value & 0xFF;
+    buf[1] = (value >> 8) & 0xFF;
+}
+
+static void int_to_four_bytes(const uint32_t value, unsigned char *buf) {
+    buf[0] = value & 0xFF;
+    buf[1] = (value >> 8)  & 0xFF;
+    buf[2] = (value >> 16) & 0xFF;
+    buf[3] = (value >> 24) & 0xFF;
 }
 
 #define MAX_CHUNK 131072
@@ -55,6 +70,22 @@ static enum HelioReturnCode extract_file(FILE *file, uint32_t offset, const char
         free(full_folder_path);
     }
 
+    char *slash = strrchr((char *)file_name, '/');
+    if (slash != NULL) {
+        size_t directory_len = slash - (char *)file_name + 1;
+
+        char new_directory[directory_len + 1];
+        memcpy(new_directory, file_name, directory_len);
+        new_directory[directory_len] = '\0';
+
+        char *full_folder_path = helio_get_path(directory_path, new_directory);
+        if (!full_folder_path) {
+            return FILE_INVALID;
+        }
+        helio_mkdir(full_folder_path);
+        free(full_folder_path);
+    }
+
     //now we're at the compressed data :0~!!
     fseek(file, extra_field_len, SEEK_CUR);
 
@@ -64,7 +95,7 @@ static enum HelioReturnCode extract_file(FILE *file, uint32_t offset, const char
         input_chunk_size = compressed_size; //for files smaller, this saves a bit of memory~
     }
     if (uncompressed_size < MAX_CHUNK) {
-        output_chunk_size = uncompressed_size; //for files smaller, this saves a bit of memory~
+        output_chunk_size = uncompressed_size;
     }
     unsigned char input_buf[input_chunk_size];
     unsigned char output_buf[output_chunk_size];
@@ -186,6 +217,164 @@ enum HelioReturnCode helio_extract(char *filename, bool verbose) {
     }
 
     free(folder_name);
+    if (remove(filename) != 0) {
+        fprintf(stderr, "failed to remove archive at %s\n", filename);
+    }
+
+    return SUCCESS;
+}
+
+enum HelioReturnCode helio_compress(char *folder_path, char *filename, char *extension, bool verbose) {
+    //first, get into our directory and list everything - we can compress each file, and then make our files based off of those~
+    char **dir_list = helio_list_dir(folder_path, false); //should be true
+    if (!dir_list) return FILE_NOT_EXIST;
+    struct HelioFile **files = NULL;
+    int num_files = 0;
+    size_t next_file_offset = 0;
+
+    char zip_file_name[strlen(filename) + strlen(extension) + 1];
+    sprintf(zip_file_name, "%s%s", filename, extension);
+    FILE *zip_file = fopen(zip_file_name, "wb");
+    if (zip_file == NULL) return FILESYSTEM_ERROR;
+
+    int skipped_num = 0;
+    for (; dir_list[num_files] != NULL; num_files++) {
+        //alright. for each file, let's compress the sucker >:3
+        files = safe_alloc(files, (num_files + 1) * sizeof(struct HelioFile *));
+        files[num_files] = safe_calloc(1, sizeof(struct HelioFile));
+        files[num_files]->compressed_data = NULL;
+
+        //now we read ^^
+        char *slash = strrchr(folder_path, '/');
+        if (slash) folder_path[slash - folder_path] = '\0';
+        char *file_path = helio_get_path(folder_path, dir_list[num_files]);
+        if (helio_dir_exists(file_path)) { //if it's actually a directory!!
+            free(file_path);
+            free(dir_list[num_files]); //we tell our stuff later on to skip this >.<
+            dir_list[num_files] = NULL;
+            skipped_num++;
+            continue; //we just continue, zip extractor doesn't care if we list directory paths neatly
+        }
+
+        FILE *file = fopen(file_path, "rb");
+        if (!file) return FILE_NOT_EXIST;
+
+        if (verbose) {
+            printf("./%s\n", file_path);
+        }
+        free(file_path);
+
+        int flush;
+        z_stream strm = {0};
+        unsigned char input_buf[MAX_CHUNK]; //unlike with decompression, we don't know ahead of time how much will be in each chunk~
+        unsigned char output_buf[MAX_CHUNK];
+
+        int deflate_ret = deflateInit2(&strm, Z_DEFAULT_COMPRESSION, Z_DEFLATED, -15, 8, Z_DEFAULT_STRATEGY);
+        if (deflate_ret != Z_OK) {
+            return DEFLATE_ERROR; //same here, not checking every error but its fine lowk.
+        }
+
+        //compress chunks until we reach eof~
+        size_t total_bytes_read = 0;
+        do {
+            strm.avail_in = fread(input_buf, 1, MAX_CHUNK, file);
+            files[num_files]->uncompressed_size += strm.avail_in;
+            if (ferror(file)) { //if we read 0 bytes and it's eof, いいじゃん。そうでなければ、いいじゃないよ
+                deflateEnd(&strm);
+                return FILE_INVALID;
+            }
+
+            flush = feof(file)? Z_FINISH : Z_NO_FLUSH; //if it's eof, we say finish :D yay
+            strm.next_in = input_buf;
+            do {
+                strm.avail_out = MAX_CHUNK;
+                strm.next_out = output_buf;
+                int deflate_ret = deflate(&strm, flush);
+                if (deflate_ret == Z_STREAM_ERROR) {
+                    return DEFLATE_ERROR;
+                }
+
+                //write to total buffer now :D
+                files[num_files]->compressed_data = safe_alloc(files[num_files]->compressed_data, strm.total_out);
+                memcpy(files[num_files]->compressed_data + total_bytes_read, output_buf, strm.total_out - total_bytes_read);
+                total_bytes_read = strm.total_out;
+            } while (strm.avail_out == 0);
+        } while (flush != Z_FINISH);
+
+        files[num_files]->compressed_size = total_bytes_read;
+        deflateEnd(&strm); //done with deflate :D
+
+        //alright~ we have the zip file open, now it's time to write the local header for this file >w<
+        unsigned char local_header[30] = {0};
+        memcpy(local_header, local_file_header, 4);
+        local_header[4] = 0x14; //min version, always 0x14
+        local_header[8] = 0x08; //method, deflate :D
+        int_to_four_bytes(files[num_files]->compressed_size, local_header + 18); //compressed size
+        int_to_four_bytes(files[num_files]->uncompressed_size, local_header + 22); //uncompressed size
+        int_to_four_bytes(strlen(dir_list[num_files]), local_header + 26); //file name len
+
+        int written = fwrite(local_header, 1, 30, zip_file);
+        if (written != 30) return FILESYSTEM_ERROR;
+
+        written = fwrite(dir_list[num_files], 1, strlen(dir_list[num_files]), zip_file);
+        if (written != (int)strlen(dir_list[num_files])) return FILESYSTEM_ERROR;
+
+        written = fwrite(files[num_files]->compressed_data, 1, files[num_files]->compressed_size, zip_file);
+        if (written != (int)files[num_files]->compressed_size) return FILESYSTEM_ERROR;
+
+        next_file_offset += strlen(dir_list[num_files]) + files[num_files]->compressed_size + 30;
+    }
+
+    //done with all of the files!!!! now, we need to do the central directory and eosd
+    //each file gets its own fun little cd :3
+    size_t cd_size = 0;
+    long start_offset = ftell(zip_file); //get current pos >_<
+    size_t file_dir_offset = 0;
+    for (int i = 0; i < num_files; i++) {
+        if (dir_list[i] == NULL) continue; //ones that are dirs
+
+        unsigned char file_cd[46] = {0};
+        memcpy(file_cd, cd_header, 4);
+        file_cd[4] = 0x33; //version made by, osu does 33 so we will too >_<
+        file_cd[6] = 0x14; //min version, always 0x14
+        file_cd[10] = 0x08; //yay we love deflate
+        int_to_four_bytes(files[i]->compressed_size, file_cd + 20); //compressed size
+        int_to_four_bytes(files[i]->uncompressed_size, file_cd + 24); //uncompressed size
+        int_to_two_bytes(strlen(dir_list[i]), file_cd + 28); //file name len~
+        int_to_four_bytes(file_dir_offset, file_cd + 42);
+
+        int written = fwrite(file_cd, 1, 46, zip_file);
+        if (written != 46) return FILESYSTEM_ERROR;
+
+        //now also write filename~
+        written = fwrite(dir_list[i], 1, strlen(dir_list[i]), zip_file);
+        if (written != (int)strlen(dir_list[i])) return FILESYSTEM_ERROR;
+
+        cd_size += 46 + strlen(dir_list[i]);
+        file_dir_offset += strlen(dir_list[i]) + files[i]->compressed_size + 30;
+    }
+
+    //eosd!!
+    unsigned char embodiment_of_scarlet_devil[22] = {0};
+    memcpy(embodiment_of_scarlet_devil, eocd_header, 4);
+    int_to_two_bytes(num_files - skipped_num, embodiment_of_scarlet_devil + 8);
+    int_to_two_bytes(num_files - skipped_num, embodiment_of_scarlet_devil + 10);
+    int_to_four_bytes(cd_size, embodiment_of_scarlet_devil + 12);
+    int_to_four_bytes(start_offset, embodiment_of_scarlet_devil + 16);
+
+    int written = fwrite(embodiment_of_scarlet_devil, 1, 22, zip_file);
+    if (written != 22) return FILESYSTEM_ERROR;
+
+    //finally, destroy everything >.<
+    for (int i = 0; i < num_files; i++) {
+        if (dir_list[i] != NULL) {
+            free(dir_list[i]);
+            free(files[i]->compressed_data);
+        }
+        free(files[i]);
+    }
+    free(files);
+    free(dir_list);
 
     return SUCCESS;
 }
@@ -200,8 +389,30 @@ enum HelioReturnCode helio_extract(char *filename, bool verbose) {
 #define MKDIR(dir) mkdir(dir, 0755);
 #endif
 
+__attribute__((noreturn)) void memory_fail_exit(void) {
+    fprintf(stderr, "memory allocation call failed, cannot continue execution >_<;;\n");
+    fprintf(stderr, "something *seriously* wrong has had to happen to get here. your system is probably on fire.. my condolences\n");
+    abort();
+}
+
+//should also include safe versions of functions like malloc and whatever here~
+//maybe also string function :0
+void *safe_alloc(void *ptr, size_t bytes) {
+    void *return_ptr = realloc(ptr, bytes);
+    if (!return_ptr) memory_fail_exit();
+
+    return return_ptr;
+}
+
+void *safe_calloc(size_t num_elements, size_t element_size) {
+    void *return_ptr = calloc(num_elements, element_size);
+    if (!return_ptr) memory_fail_exit();
+
+    return return_ptr;
+}
+
 void helio_mkdir(const char *dir_path) { //makes parent directories too :3
-    char *dir_copy = strdup(dir_path);  // make a copy we can modify
+    char *dir_copy = strdup(dir_path);  //make a copy we can modify
     char *char_ptr = NULL;
     int mk_return = 0;
     if (dir_copy[strlen(dir_copy) - 1] == '/') { //we usually shouldn't get this with a slash at the end, but just in case~
@@ -240,7 +451,7 @@ bool helio_dir_exists(const char *directory) {
 //super fucking useful!! caller must free >_<,,
 char *helio_get_path(const char *prev_dir, const char *name) {
     size_t new_path_len = strlen(prev_dir) + strlen(name) + 2; //two new characters - / and \0
-    char *path = calloc(1, new_path_len);
+    char *path = safe_calloc(1, new_path_len);
 
     int length_written = sprintf(path, "%s/%s", prev_dir, name);
     if (length_written != (int)(new_path_len - 1)) { //im kinda sus of this but maybe this is just okay
@@ -249,4 +460,60 @@ char *helio_get_path(const char *prev_dir, const char *name) {
     }
 
     return path;
+}
+
+char **helio_list_dir(const char *directory, bool recusrive) {
+    DIR *dir = opendir(directory);
+    if (dir == NULL) {
+        fprintf(stderr, "couldn't open directory %s @_@!! probably isn't a directory.\n", directory);
+        return NULL;
+    }
+
+    struct dirent *entry = readdir(dir);
+    int dir_entries = 0; //first, let's count how many entries are right here =w=
+    while (entry != NULL) {
+        dir_entries++;
+        entry = readdir(dir);
+    }
+
+    char **directory_entries = safe_calloc(dir_entries + 1, sizeof(char *));
+    rewinddir(dir); //we're at the end of the directory after the while loop, so we need to rewind >.<
+
+    int i = 0;
+    while ((entry = readdir(dir)) != NULL) { //need another loop to read over the contents again~~
+        if (entry->d_name[0] == '.') { //skip hidden files like ., .., .DS_Store, etc~
+            continue;
+        }
+
+        //while some files don't have extentions of course, anything used here will likely have an extension and therefore
+        //anything not having one will be a folder. we can recusively call ourselves to get the contents of each folder~
+        if (strchr(entry->d_name, '.') == 0 && recusrive) { //none found
+            char *new_dir_path = helio_get_path(directory, entry->d_name);
+            char **new_directory_contents = helio_list_dir(new_dir_path, recusrive);
+            free(new_dir_path);
+
+            //count the number of entries in the directory we have here >.<
+            int num_new_files = 0;
+            while (new_directory_contents[num_new_files] != NULL) {
+                num_new_files++;
+            }
+
+            dir_entries += num_new_files;
+            directory_entries = safe_alloc(directory_entries, (dir_entries + 1) * sizeof(char *));
+            for (int j = 0; j < num_new_files; j++) {
+                directory_entries[i + j] = helio_get_path(entry->d_name, new_directory_contents[j]);
+                free(new_directory_contents[j]);
+            }
+            i += num_new_files;
+            free(new_directory_contents);
+        }
+
+        directory_entries[i] = strdup(entry->d_name);
+        i++;
+    }
+
+    directory_entries[dir_entries] = NULL; //the array needs to be null terminated too :3
+    closedir(dir);
+
+    return directory_entries;
 }
