@@ -1,15 +1,14 @@
 #include "heliotrope.h"
 
+#include <dirent.h>
 #include <errno.h>
 #include <stdbool.h>
 #include <stdint.h>
-#include <dirent.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <zlib.h>
-
-//TODO: crc32, file modification time, fix crash extracting some (osugds)
 
 static uint16_t two_byte_to_int(const unsigned char byte_1, const unsigned char byte_2) {
     return byte_1 | (byte_2 << 8);
@@ -71,7 +70,7 @@ static enum HelioReturnCode extract_file(FILE *file, uint32_t offset, const char
     }
 
     char *slash = strrchr((char *)file_name, '/');
-    if (slash != NULL) {
+    if (slash != NULL) { //creates all parent directories :3
         size_t directory_len = slash - (char *)file_name + 1;
 
         char new_directory[directory_len + 1];
@@ -102,10 +101,14 @@ static enum HelioReturnCode extract_file(FILE *file, uint32_t offset, const char
 
     //let's create the file >.<
     char *file_path = helio_get_path(directory_path, (char *)file_name);
-    if (!file_path) {
-        return FILE_INVALID;
+    if (!file_path) return FILE_INVALID;
+
+    //we could get things that are just Not files through here. in order to deal with that, dir check~
+    if (uncompressed_size == 0) {
+        return SUCCESS;
     }
     FILE *new_file = fopen(file_path, "w");
+    if (!new_file) return FILESYSTEM_ERROR;
     free(file_path);
 
     if (compression_method == 8) {
@@ -195,7 +198,7 @@ enum HelioReturnCode helio_extract(char *filename, bool verbose) {
     //each file has its own little central directory >_<!! we need to get all the values we want from her~
     size_t offset = 0;
     for (int i = 0; i < num_files; i++) {
-        uint32_t crc32 = four_byte_to_int(central_directory[16 + offset], central_directory[17 + offset], central_directory[18 + offset], central_directory[19 + offset]);
+        //lowkey wont bother with crc32. if its corrupt its corrupt bro LOL
         uint16_t file_name_len = two_byte_to_int(central_directory[28 + offset], central_directory[29 + offset]);
         uint16_t extra_field_len = two_byte_to_int(central_directory[30 + offset], central_directory[31 + offset]);
         uint16_t file_comment_len = two_byte_to_int(central_directory[32 + offset], central_directory[33 + offset]);
@@ -226,8 +229,16 @@ enum HelioReturnCode helio_extract(char *filename, bool verbose) {
 
 enum HelioReturnCode helio_compress(char *folder_path, char *filename, char *extension, bool verbose) {
     //first, get into our directory and list everything - we can compress each file, and then make our files based off of those~
-    char **dir_list = helio_list_dir(folder_path, false); //should be true
+    char *slash = strrchr(folder_path, '/');
+    if (slash) folder_path[slash - folder_path] = '\0';
+
+    char **dir_list = helio_list_dir(folder_path, true);
     if (!dir_list) return FILE_NOT_EXIST;
+
+    for (int i = 0; dir_list[i] != NULL; i++) {
+        printf("%s\n", dir_list[i]);
+    }
+
     struct HelioFile **files = NULL;
     int num_files = 0;
     size_t next_file_offset = 0;
@@ -237,6 +248,13 @@ enum HelioReturnCode helio_compress(char *folder_path, char *filename, char *ext
     FILE *zip_file = fopen(zip_file_name, "wb");
     if (zip_file == NULL) return FILESYSTEM_ERROR;
 
+    //every file should be created at the same time, so let's just resolve that right away hehe~
+    //also kinda. whatever code but its ok.
+    time_t current_time = time(NULL);
+    struct tm *ima = localtime(&current_time);
+    uint16_t zip_time = (ima->tm_hour << 11) | (ima->tm_min  << 5) | (ima->tm_sec  / 2);
+    uint16_t zip_date = ((ima->tm_year - 80) << 9) | ((ima->tm_mon + 1) << 5) | (ima->tm_mday); //zip wants time from 1980 in a weird format >_>
+
     int skipped_num = 0;
     for (; dir_list[num_files] != NULL; num_files++) {
         //alright. for each file, let's compress the sucker >:3
@@ -245,8 +263,6 @@ enum HelioReturnCode helio_compress(char *folder_path, char *filename, char *ext
         files[num_files]->compressed_data = NULL;
 
         //now we read ^^
-        char *slash = strrchr(folder_path, '/');
-        if (slash) folder_path[slash - folder_path] = '\0';
         char *file_path = helio_get_path(folder_path, dir_list[num_files]);
         if (helio_dir_exists(file_path)) { //if it's actually a directory!!
             free(file_path);
@@ -274,10 +290,14 @@ enum HelioReturnCode helio_compress(char *folder_path, char *filename, char *ext
             return DEFLATE_ERROR; //same here, not checking every error but its fine lowk.
         }
 
+        //also init crc32 calc. used for data verification ofc~
+        files[num_files]->crc_uncompressed = crc32(0L, Z_NULL, 0);
+
         //compress chunks until we reach eof~
         size_t total_bytes_read = 0;
         do {
             strm.avail_in = fread(input_buf, 1, MAX_CHUNK, file);
+            files[num_files]->crc_uncompressed = crc32(files[num_files]->crc_uncompressed, input_buf, strm.avail_in);
             files[num_files]->uncompressed_size += strm.avail_in;
             if (ferror(file)) { //if we read 0 bytes and it's eof, いいじゃん。そうでなければ、いいじゃないよ
                 deflateEnd(&strm);
@@ -309,6 +329,9 @@ enum HelioReturnCode helio_compress(char *folder_path, char *filename, char *ext
         memcpy(local_header, local_file_header, 4);
         local_header[4] = 0x14; //min version, always 0x14
         local_header[8] = 0x08; //method, deflate :D
+        int_to_two_bytes(zip_time, local_header + 10);
+        int_to_two_bytes(zip_date, local_header + 12);
+        int_to_four_bytes(files[num_files]->crc_uncompressed, local_header + 14); //crc32~ data validation shit
         int_to_four_bytes(files[num_files]->compressed_size, local_header + 18); //compressed size
         int_to_four_bytes(files[num_files]->uncompressed_size, local_header + 22); //uncompressed size
         int_to_four_bytes(strlen(dir_list[num_files]), local_header + 26); //file name len
@@ -338,6 +361,9 @@ enum HelioReturnCode helio_compress(char *folder_path, char *filename, char *ext
         file_cd[4] = 0x33; //version made by, osu does 33 so we will too >_<
         file_cd[6] = 0x14; //min version, always 0x14
         file_cd[10] = 0x08; //yay we love deflate
+        int_to_two_bytes(zip_time, file_cd + 12);
+        int_to_two_bytes(zip_date, file_cd + 14);
+        int_to_four_bytes(files[i]->crc_uncompressed, file_cd + 16);
         int_to_four_bytes(files[i]->compressed_size, file_cd + 20); //compressed size
         int_to_four_bytes(files[i]->uncompressed_size, file_cd + 24); //uncompressed size
         int_to_two_bytes(strlen(dir_list[i]), file_cd + 28); //file name len~
@@ -355,6 +381,7 @@ enum HelioReturnCode helio_compress(char *folder_path, char *filename, char *ext
     }
 
     //eosd!!
+    printf("writing eosd to file...\n");
     unsigned char embodiment_of_scarlet_devil[22] = {0};
     memcpy(embodiment_of_scarlet_devil, eocd_header, 4);
     int_to_two_bytes(num_files - skipped_num, embodiment_of_scarlet_devil + 8);
@@ -487,10 +514,13 @@ char **helio_list_dir(const char *directory, bool recusrive) {
 
         //while some files don't have extentions of course, anything used here will likely have an extension and therefore
         //anything not having one will be a folder. we can recusively call ourselves to get the contents of each folder~
-        if (strchr(entry->d_name, '.') == 0 && recusrive) { //none found
-            char *new_dir_path = helio_get_path(directory, entry->d_name);
+        char *new_dir_path = helio_get_path(directory, entry->d_name);
+        if (helio_dir_exists(new_dir_path) && recusrive) { //none found
             char **new_directory_contents = helio_list_dir(new_dir_path, recusrive);
-            free(new_dir_path);
+            if (new_directory_contents == NULL) {
+                free(new_dir_path);
+                continue;
+            }
 
             //count the number of entries in the directory we have here >.<
             int num_new_files = 0;
@@ -505,14 +535,17 @@ char **helio_list_dir(const char *directory, bool recusrive) {
                 free(new_directory_contents[j]);
             }
             i += num_new_files;
+            free(new_dir_path);
             free(new_directory_contents);
+            continue;
         }
+        free(new_dir_path);
 
         directory_entries[i] = strdup(entry->d_name);
         i++;
     }
 
-    directory_entries[dir_entries] = NULL; //the array needs to be null terminated too :3
+    directory_entries[i] = NULL; //the array needs to be null terminated too :3
     closedir(dir);
 
     return directory_entries;

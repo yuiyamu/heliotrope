@@ -2,6 +2,7 @@
 #define HELIOTROPE_H_
 
 #include <stdbool.h>
+#include <stdint.h>
 #include <stdio.h>
 
 enum HelioReturnCode {
@@ -16,6 +17,7 @@ enum HelioReturnCode {
 struct HelioFile {
   size_t uncompressed_size;
   size_t compressed_size;
+  uint32_t crc_uncompressed;
   unsigned char *compressed_data; //only need to hold compressed in memory~
   
   char *file_name;

@@ -36,7 +36,7 @@ static int parse_return_code(const enum HelioReturnCode extract_code) {
       break;
     }
     case FILESYSTEM_ERROR: {
-      fprintf(stderr, "something went wrong when dealing with filesystem i/o.\ndo you have enough free space on your device, and permissions to the files?");
+      fprintf(stderr, "something went wrong when dealing with filesystem i/o.\ndo you have enough free space on your device, and permissions to the files?\n");
       break;
     }
   }
@@ -45,7 +45,7 @@ static int parse_return_code(const enum HelioReturnCode extract_code) {
 }
 
 int main(int argc, char **argv) {
-  printf("heliotrope - version 1.0.0\nan incredibly simple zip extractor, made by yuiyamu\n\n");
+  printf("heliotrope - version 1.1.0\nan incredibly simple zip extractor, made by yuiyamu\n\n");
 
   bool create_archive = false;
   bool verbose = false;
