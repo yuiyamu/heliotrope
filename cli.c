@@ -100,7 +100,7 @@ int main(int argc, char **argv) {
     }
 
     char *filename = argv[optind];
-    printf("extracting %s...\n", argv[1]);
+    printf("extracting %s...\n", filename);
     return parse_return_code(helio_extract(filename, verbose));
   }
 }
