@@ -45,7 +45,7 @@ static int parse_return_code(const enum HelioReturnCode extract_code) {
 }
 
 int main(int argc, char **argv) {
-  printf("heliotrope - version 1.1.0\nan incredibly simple zip extractor, made by yuiyamu\n\n");
+  printf("heliotrope - version 1.1.1\nan incredibly simple zip extractor, made by yuiyamu\n\n");
 
   bool create_archive = false;
   bool verbose = false;
