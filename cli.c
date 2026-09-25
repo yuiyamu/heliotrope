@@ -14,28 +14,28 @@ static void print_help(void) {
 static int parse_return_code(const enum HelioReturnCode extract_code) {
   int ret_code = 1;
   switch (extract_code) {
-    case SUCCESS: {
+    case HELIO_SUCCESS: {
       printf("success.\n");
       ret_code = 0;
       break;
     }
-    case FILE_NOT_EXIST: {
+    case HELIO_FILE_NOT_EXIST: {
       fprintf(stderr, "provided file does not exist.\n");
       break;
     }
-    case FILE_INVALID: {
+    case HELIO_FILE_INVALID: {
       fprintf(stderr, "provided file is not a valid zip file.\n");
       break;
     }
-    case INVALID_COMPRESSION_METHOD: {
+    case HELIO_INVALID_COMPRESSION_METHOD: {
       fprintf(stderr, "provided file uses a compression method not supported by heliotrope.\n");
       break;
     }
-    case DEFLATE_ERROR: {
+    case HELIO_DEFLATE_ERROR: {
       fprintf(stderr, "provided zip file failed to be parsed by the deflate algorithm.\n");
       break;
     }
-    case FILESYSTEM_ERROR: {
+    case HELIO_FILESYSTEM_ERROR: {
       fprintf(stderr, "something went wrong when dealing with filesystem i/o.\ndo you have enough free space on your device, and permissions to the files?\n");
       break;
     }
@@ -45,7 +45,7 @@ static int parse_return_code(const enum HelioReturnCode extract_code) {
 }
 
 int main(int argc, char **argv) {
-  printf("heliotrope - version 1.1.1\nan incredibly simple zip extractor, made by yuiyamu\n\n");
+  printf("heliotrope - version 1.2.0\nan incredibly simple zip extractor, made by yuiyamu\n\n");
 
   bool create_archive = false;
   bool verbose = false;
@@ -101,6 +101,6 @@ int main(int argc, char **argv) {
 
     char *filename = argv[optind];
     printf("extracting %s...\n", filename);
-    return parse_return_code(helio_extract(filename, verbose));
+    return parse_return_code(helio_extract(filename, verbose, NULL, true, false));
   }
 }

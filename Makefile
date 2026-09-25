@@ -1,6 +1,6 @@
 CC = gcc
 CSTD = -std=c99
-CFLAGS = -Wall -Wextra -g -O3 -fsanitize=address -fno-omit-frame-pointer
+CFLAGS = -Wall -Wextra -g -Os
 LDFLAGS = -fsanitize=address -lz
 
 TARGET  = heliotrope
