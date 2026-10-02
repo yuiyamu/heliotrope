@@ -1,5 +1,7 @@
 # heliotrope
 
+![heliotrope banner](https://yamu.yuru.ca/cgwoye3y599.png)
+
 a highly specialized zlib wrapper for light zip extraction/creation
 
 ## info
