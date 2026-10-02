@@ -1,5 +1,9 @@
 #include "heliotrope.h"
 
+#ifdef HAVE_CONFIG_H
+#include <config.h>
+#endif
+
 #include <stdio.h>
 #include <stdbool.h>
 #include <string.h>
@@ -7,8 +11,10 @@
 
 static void print_help(void) {
   printf("Usage: [file] when extracting an archive,\n    or [directory] [file] when creating an archive.\n\n");
-  printf("    -c, --create   creates an archive instead of extracting\n");
-  printf("    -v, --verbose  uses verbose output\n");
+  printf("    -c, --create                creates an archive instead of extracting\n");
+  printf("    -v, --verbose               uses verbose output\n");
+  printf("    -r, --remove-archive        deletes archive after extraction\n");
+  printf("    -d, --no-create-directory   extracts files to the current directory, instead of creating an output folder\n");
 }
 
 static int parse_return_code(const enum HelioReturnCode extract_code) {
@@ -45,19 +51,23 @@ static int parse_return_code(const enum HelioReturnCode extract_code) {
 }
 
 int main(int argc, char **argv) {
-  printf("heliotrope - version 1.2.0\nan incredibly simple zip extractor, made by yuiyamu\n\n");
+  printf("heliotrope - version 1.2.1\nan incredibly simple zip extractor, made by yuiyamu\n\n");
 
   bool create_archive = false;
   bool verbose = false;
+  bool delete_after_extract = false;
+  bool create_dir = true;
   static struct option long_opts[] = { //for getopt_long, we need this kind of struct hehe~
     { "create",  no_argument, NULL, 'c' },
     { "verbose", no_argument, NULL, 'v' },
+    { "remove-archive", no_argument, NULL, 'r' },
+    { "no-create-directory", no_argument, NULL, 'd' },
     { "help",    no_argument, NULL, 'h' },
     { NULL, 0, NULL, 0 }
   };
 
   int opt;
-  while ((opt = getopt_long(argc, argv, "cvh", long_opts, NULL)) != -1) {
+  while ((opt = getopt_long(argc, argv, "cvrdh", long_opts, NULL)) != -1) {
     switch (opt) {
       case 'c': {
         create_archive = true;
@@ -65,6 +75,14 @@ int main(int argc, char **argv) {
       }
       case 'v': {
         verbose = true;
+        break;
+      }
+      case 'r': {
+        delete_after_extract = true;
+        break;
+      }
+      case 'd': {
+        create_dir = false;
         break;
       }
       case 'h': {
@@ -89,7 +107,7 @@ int main(int argc, char **argv) {
     }
     char *folder_path = argv[optind];
     char *filename = remaining_params > 1? argv[optind + 1] : argv[optind];
-    return parse_return_code(helio_compress(folder_path, filename, ".zip", verbose));
+    return parse_return_code(helio_compress(folder_path, filename, NULL, verbose));
   } else {
     if (remaining_params == 0) {
       fprintf(stderr, "no input file.\n");
@@ -101,6 +119,6 @@ int main(int argc, char **argv) {
 
     char *filename = argv[optind];
     printf("extracting %s...\n", filename);
-    return parse_return_code(helio_extract(filename, verbose, NULL, true, false));
+    return parse_return_code(helio_extract(filename, verbose, NULL, create_dir, delete_after_extract, NULL));
   }
 }

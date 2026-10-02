@@ -1,15 +1,29 @@
+#ifndef _WIN32
+#define _POSIX_C_SOURCE 200112L
+#endif
+
 #include "heliotrope.h"
 
+#ifdef _WIN32
+#include <windows.h>
+#include <direct.h>
+#define MKDIR(dir) _mkdir(dir)
+#else
 #include <sys/stat.h>
+#include <unistd.h>
+#include <time.h>
+#include <utime.h>
 #include <fcntl.h>
 #include <dirent.h>
+#define MKDIR(dir) mkdir(dir, 0755);
+#endif
+
 #include <errno.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <time.h>
 #include <zlib.h>
 
 static uint16_t two_byte_to_int(const unsigned char byte_1, const unsigned char byte_2) {
@@ -168,7 +182,7 @@ static enum HelioReturnCode extract_file(FILE *file, uint32_t offset, const char
 }
 
 
-enum HelioReturnCode helio_extract(char *filename, bool verbose, char *base_directory, bool create_extract_folder, bool remove_after_extract) {        
+enum HelioReturnCode helio_extract(char *filename, bool verbose, char *base_directory, bool create_extract_folder, bool remove_after_extract, char ***files_extracted) {        
     FILE *file = fopen(filename, "rb");
     if (file == NULL) return HELIO_FILE_NOT_EXIST;
     //we don't look at the start of the zip file, since technically the first file offset could be anywhere
@@ -207,7 +221,7 @@ enum HelioReturnCode helio_extract(char *filename, bool verbose, char *base_dire
     //making output directory, additional directories inside must be made seperately~
     char *folder_name = NULL;
     if (create_extract_folder) {
-        folder_name = strdup(filename);
+        folder_name = helio_strdup(filename);
         int filename_offset = 0;
         if (folder_name[0] == '.' && folder_name[1] == '/') {
             //for purposes down the line, we'll make sure that there's no "./" in front~
@@ -222,7 +236,7 @@ enum HelioReturnCode helio_extract(char *filename, bool verbose, char *base_dire
 
     char *folder_path = NULL;
     if (base_directory == NULL) {
-        folder_path = strdup(folder_name);
+        folder_path = helio_strdup(folder_name);
     } else {
         folder_path = helio_get_path(base_directory, folder_name);
     }
@@ -231,6 +245,10 @@ enum HelioReturnCode helio_extract(char *filename, bool verbose, char *base_dire
 
     //each file has its own little central directory >_<!! we need to get all the values we want from her~
     size_t offset = 0;
+    if (files_extracted != NULL) {
+        *files_extracted = safe_calloc(num_files + 1, sizeof(char *));
+        (*files_extracted)[num_files] = NULL; //already can null term~
+    }
     for (int i = 0; i < num_files; i++) {
         //lowkey wont bother with crc32. if its corrupt its corrupt bro LOL
         uint16_t dos_time = two_byte_to_int(central_directory[12 + offset], central_directory[13 + offset]);
@@ -250,13 +268,16 @@ enum HelioReturnCode helio_extract(char *filename, bool verbose, char *base_dire
         if (verbose) {
             printf("  %s/%s\n", folder_path, filename);
         }
+        if (files_extracted != NULL) {
+            (*files_extracted)[i] = helio_strdup(filename);
+        }
 
         enum HelioReturnCode file_code = extract_file(file, file_offset, folder_path);
         if (file_code != HELIO_SUCCESS) {
             return file_code;
         }
 
-        //also need to restore file permissions~
+        //also need to restore file permissions~ this is shima exclusive for now >.<
         //this also only works with unix but i cant be bothered to not do unix right now
         char *file_path = helio_get_path(folder_path, (char *)filename);
         external_file_attributes = external_file_attributes >> 16; //shift 16 bits for unix perms~
@@ -279,6 +300,7 @@ enum HelioReturnCode helio_extract(char *filename, bool verbose, char *base_dire
         }
 
         //finally, we gotta restore the file modification time >_> ughhh
+#ifndef _WIN32        
         struct tm unix_time = {0}; //stupid ass struct that deals with unix time
 
         unix_time.tm_mday = dos_date & 0x1F;
@@ -289,11 +311,20 @@ enum HelioReturnCode helio_extract(char *filename, bool verbose, char *base_dire
         unix_time.tm_hour = (dos_time >> 11) & 0x1F;
         unix_time.tm_isdst = -1; //is it daylight savings? figure it out bozo.
 
-        struct timespec time_struct[2];
-        time_struct[0].tv_nsec = UTIME_OMIT; //no access time idc
-        time_struct[1].tv_sec = mktime(&unix_time);
-        time_struct[1].tv_nsec = 0;
-        utimensat(AT_FDCWD, file_path, time_struct, AT_SYMLINK_NOFOLLOW);
+        //for older posix, we need to stat the file and then use That as the access time :p
+        struct stat file_stat;
+        time_t access_time = time(NULL); //just default jan 1 1970 if we cant access its not a big deal
+        if (stat(file_path, &file_stat) != 0) {
+            access_time = file_stat.st_atime;
+        }
+
+        //ok now can update our file time :3
+        struct utimbuf time_struct;
+        time_struct.actime = access_time; //no access time idc
+        time_struct.modtime = mktime(&unix_time);
+        utime(file_path, &time_struct);
+#elif
+#endif
 
         free(file_path);
 
@@ -308,6 +339,7 @@ enum HelioReturnCode helio_extract(char *filename, bool verbose, char *base_dire
     fclose(file);
     free(folder_path);
     free(folder_name);
+    free(central_directory);
 
     return HELIO_SUCCESS;
 }
@@ -341,6 +373,7 @@ enum HelioReturnCode helio_compress(char *folder_path, char *filename, char *ext
         files = safe_alloc(files, (num_files + 1) * sizeof(struct HelioFile *));
         files[num_files] = safe_calloc(1, sizeof(struct HelioFile));
         files[num_files]->compressed_data = NULL;
+        files[num_files]->method = -1; //if we skip, we know this file is invalid by the method~
 
         //now we read ^^
         char *file_path = helio_get_path(folder_path, dir_list[num_files]);
@@ -354,7 +387,10 @@ enum HelioReturnCode helio_compress(char *folder_path, char *filename, char *ext
 
         //before anything else, we must see if this file is actually a symlink, and not blindly follow it.
         struct stat file_stat;
-        if (lstat(file_path, &file_stat) == -1) return HELIO_FILE_NOT_EXIST;
+        if (lstat(file_path, &file_stat) == -1) {
+            fprintf(stderr, "  * warning: could not stat %s, skipping...\n", file_path);
+            continue;
+        }
         if (S_ISLNK(file_stat.st_mode)) {
             //now this gets rather interesting. this file is a symlink, meaning we just store (0) where the link goes to =w=
             unsigned char sym_buf[1024] = {0};
@@ -362,7 +398,10 @@ enum HelioReturnCode helio_compress(char *folder_path, char *filename, char *ext
             //bit unsafe, but it's an edge case to have 1024+ chars in a symlink
             
             ssize_t amt_read = readlink(file_path, (char *)sym_buf, sizeof(sym_buf) - 1);
-            if (amt_read == -1) return HELIO_FILE_INVALID;
+            if (amt_read == -1) {
+                fprintf(stderr, "  * warning: could not read symlink %s, skipping...\n", file_path);
+                continue;
+            }
             sym_buf[amt_read] = '\0'; //this needs manual null termination lol~
             
             //since we're just storing, we can set things like compressed and decompressed size rn
@@ -370,11 +409,14 @@ enum HelioReturnCode helio_compress(char *folder_path, char *filename, char *ext
             files[num_files]->uncompressed_size = amt_read;
             files[num_files]->crc_uncompressed = crc32(0L, Z_NULL, 0);
             files[num_files]->crc_uncompressed = crc32(files[num_files]->crc_uncompressed, sym_buf, amt_read);
-            files[num_files]->compressed_data = (unsigned char *)strdup((char *)sym_buf);
+            files[num_files]->compressed_data = (unsigned char *)helio_strdup((char *)sym_buf);
             files[num_files]->method = 0x00; //store!!
         } else {
             FILE *file = fopen(file_path, "rb");
-            if (!file) return HELIO_FILE_NOT_EXIST;
+            if (!file) {
+                fprintf(stderr, "  * warning: couldn't open file %s, skipping...\n", file_path);
+                continue;
+            }
 
             if (verbose) {
                 printf("  %s\n", file_path);
@@ -388,7 +430,8 @@ enum HelioReturnCode helio_compress(char *folder_path, char *filename, char *ext
 
             int deflate_ret = deflateInit2(&strm, Z_DEFAULT_COMPRESSION, Z_DEFLATED, -15, 8, Z_DEFAULT_STRATEGY);
             if (deflate_ret != Z_OK) {
-                return HELIO_DEFLATE_ERROR; //same here, not checking every error but its fine lowk.
+                fprintf(stderr, "  * warning: error while compressing %s, skipping...\n", file_path);
+                continue;
             }
 
             //also init crc32 calc. used for data verification ofc~
@@ -402,7 +445,8 @@ enum HelioReturnCode helio_compress(char *folder_path, char *filename, char *ext
                 files[num_files]->uncompressed_size += strm.avail_in;
                 if (ferror(file)) { //if we read 0 bytes and it's eof, いいじゃん。そうでなければ、いいじゃないよ
                     deflateEnd(&strm);
-                    return HELIO_FILE_INVALID;
+                    fprintf(stderr, "  * warning: error while compressing %s, skipping...\n", file_path);
+                    continue;
                 }
 
                 flush = feof(file)? Z_FINISH : Z_NO_FLUSH; //if it's eof, we say finish :D yay
@@ -412,7 +456,8 @@ enum HelioReturnCode helio_compress(char *folder_path, char *filename, char *ext
                     strm.next_out = output_buf;
                     int deflate_ret = deflate(&strm, flush);
                     if (deflate_ret == Z_STREAM_ERROR) {
-                        return HELIO_DEFLATE_ERROR;
+                        fprintf(stderr, "  * warning: error while compressing %s, skipping...\n", file_path);
+                        continue;
                     }
 
                     //write to total buffer now :D
@@ -425,6 +470,7 @@ enum HelioReturnCode helio_compress(char *folder_path, char *filename, char *ext
             files[num_files]->compressed_size = total_bytes_read;
             files[num_files]->method = 0x08; //don't forget to set to deflate!!
             deflateEnd(&strm); //done with deflate :D
+            fclose(file);
         }
 
         //alright~ we have the zip file open, now it's time to write the local header for this file >w<
@@ -440,7 +486,7 @@ enum HelioReturnCode helio_compress(char *folder_path, char *filename, char *ext
         int_to_four_bytes(strlen(dir_list[num_files]), local_header + 26); //file name len
 
         size_t written = fwrite(local_header, 1, 30, zip_file);
-        if (written != 30) return HELIO_FILESYSTEM_ERROR;
+        if (written != 30) return HELIO_FILESYSTEM_ERROR; //these are legit hare blocking errors that we'd like to Not just warn about =w=
 
         written = fwrite(dir_list[num_files], 1, strlen(dir_list[num_files]), zip_file);
         if (written != (unsigned long)strlen(dir_list[num_files])) return HELIO_FILESYSTEM_ERROR;
@@ -456,12 +502,13 @@ enum HelioReturnCode helio_compress(char *folder_path, char *filename, char *ext
     size_t file_dir_offset = 0;
     for (int i = 0; i < num_files; i++) {
         if (dir_list[i] == NULL) continue; //ones that are dirs
+        if (files[i]->method == -1) continue; //skipped above :3
 
         //ooh also!! getting unix permission bits for this file ^-^ only in cd ig
         struct stat file_stat;
         char *file_path = helio_get_path(folder_path, dir_list[i]);
         if (lstat(file_path, &file_stat) == -1) {
-            return HELIO_FILESYSTEM_ERROR;
+            return HELIO_FILESYSTEM_ERROR; //this should not happen, we've already skipped the files above that we couldn't stat/open
         }
         uint32_t permissions = file_stat.st_mode << 16; //making it happier for zip~
         free(file_path);
@@ -518,25 +565,39 @@ enum HelioReturnCode helio_compress(char *folder_path, char *filename, char *ext
     return HELIO_SUCCESS;
 }
 
-#ifdef _WIN32
-#include <windows.h>
-#include <direct.h>
-#define MKDIR(dir) _mkdir(dir)
-#else
-#include <sys/stat.h>
-#include <unistd.h>
-#define MKDIR(dir) mkdir(dir, 0755);
-#endif
+char *helio_error_to_string(enum HelioReturnCode ret_code) {
+    switch (ret_code) {
+        case HELIO_SUCCESS: {
+            return "success";
+        }
+        case HELIO_FILE_NOT_EXIST: {
+            return "provided file does not exist";
+        }
+        case HELIO_FILE_INVALID: {
+            return "provided file was invalid";
+        }
+        case HELIO_INVALID_COMPRESSION_METHOD: {
+            return "zip file uses an unsupported compression method";
+        }
+        case HELIO_DEFLATE_ERROR: {
+            return "error while uncompressing deflate stream";
+        }
+        case HELIO_FILESYSTEM_ERROR: {
+            return "unable to read/write to the filesystem";
+        }
+    }
+}
 
 __attribute__((noreturn)) void memory_fail_exit(void) {
     fprintf(stderr, "memory allocation call failed, cannot continue execution >_<;;\n");
-    fprintf(stderr, "something *seriously* wrong has had to happen to get here. your system is probably on fire.. my condolences\n");
     abort();
 }
 
 //should also include safe versions of functions like malloc and whatever here~
 //maybe also string function :0
 void *safe_alloc(void *ptr, size_t bytes) {
+    if (bytes == 0) return NULL; //0 alloc causes a NULL, and we read this as a fail >.<
+
     void *return_ptr = realloc(ptr, bytes);
     if (!return_ptr) memory_fail_exit();
 
@@ -544,14 +605,39 @@ void *safe_alloc(void *ptr, size_t bytes) {
 }
 
 void *safe_calloc(size_t num_elements, size_t element_size) {
+    if (num_elements == 0 || element_size == 0) return NULL;
+
     void *return_ptr = calloc(num_elements, element_size);
     if (!return_ptr) memory_fail_exit();
 
     return return_ptr;
 }
 
+//this can be used by many outside programs that i use this with >.<
+void helio_del_strarr(char ***strarr) {
+    if (strarr == NULL || *strarr == NULL) return; //already nulled out yo >_<
+
+    for (char **cur_str = *strarr; *cur_str != NULL; cur_str++) {
+        free(*cur_str);
+        *cur_str = NULL;
+    }
+    free(*strarr);
+    *strarr = NULL;
+}
+
+//only defining this since we may not have strdup in POSIX-2001
+//and like... in windows lmfao
+char *helio_strdup(const char *string) {
+    size_t alloc_size = strlen(string) + 1; //take a WILD guess as to what the +1 is for. really.
+    char *dup_string = safe_calloc(1, alloc_size);
+
+    if (dup_string == NULL) return NULL;
+
+    return memcpy(dup_string, string, alloc_size); //return pointer~
+}
+
 void helio_mkdir(const char *dir_path) { //makes parent directories too :3
-    char *dir_copy = strdup(dir_path);  //make a copy we can modify
+    char *dir_copy = helio_strdup(dir_path);  //make a copy we can modify
     char *char_ptr = NULL;
     int mk_return = 0;
     if (dir_copy[strlen(dir_copy) - 1] == '/') { //we usually shouldn't get this with a slash at the end, but just in case~
@@ -562,16 +648,16 @@ void helio_mkdir(const char *dir_path) { //makes parent directories too :3
         if (*char_ptr == '/') { //we increase what character we're on until we get to a / :3
             *char_ptr = 0;
             mk_return = MKDIR(dir_copy);
-            if (mk_return != 0 && errno != EEXIST) {
-                fprintf(stderr, "%s while trying to create directory %s >.<\n", strerror(errno), dir_path);
+            if (mk_return != 0 && errno != EEXIST && errno != EISDIR) {
+                fprintf(stderr, "got error \"%s\" while trying to create directory %s >.<\n", strerror(errno), dir_path);
             }
             *char_ptr = '/';
         }
     }
 
     mk_return = MKDIR(dir_copy); //now we can make the final path yayyyy
-    if (mk_return != 0 && errno != EEXIST) {
-        fprintf(stderr, "%s while trying to create directory %s >.<\n", strerror(errno), dir_path);
+    if (mk_return != 0 && errno != EEXIST && errno != EISDIR) {
+        fprintf(stderr, "got error \"%s\" while trying to create directory %s >.<\n", strerror(errno), dir_path);
     }
 
     free(dir_copy);
@@ -653,7 +739,7 @@ char **helio_list_dir(const char *directory, bool recusrive) {
         }
         free(new_dir_path);
 
-        directory_entries[i] = strdup(entry->d_name);
+        directory_entries[i] = helio_strdup(entry->d_name);
         i++;
     }
 
